@@ -1,0 +1,21 @@
+<instance format="XCSP3" type="CSP">
+  <variables>
+    <array id="c" note="c [ i ] is the ith city of the tour" size="[5]"> 0..4 </array>
+    <array id="d" note="d [ i ] is the distance between the cities i and i +1 chosen in the tour" size="[5]"> 0 1 4 5 6 7 8 9 </array>
+  </variables>
+  <constraints>
+    <allDifferent note="Visiting each city only once"> c[] </allDifferent>
+    <group note="computing the distance between any two successive cities in the tour">
+      <element>
+        <matrix> (0,5,6,6,6)(5,0,9,8,4)(6,9,0,1,7)(6,8,1,0,6)(6,4,7,6,0) </matrix>
+        <index> %0 %1 </index>
+        <value> %2 </value>
+      </element>
+      <args> c[0] c[1] d[0] </args>
+      <args> c[1] c[2] d[1] </args>
+      <args> c[2] c[3] d[2] </args>
+      <args> c[3] c[4] d[3] </args>
+      <args> c[4] c[0] d[4] </args>
+    </group>
+  </constraints>
+</instance>

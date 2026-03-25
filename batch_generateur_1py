@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+batch_generateur.py
+Run generateur.py N times and write the names of every .dot file produced
+during each run to an Excel spreadsheet (one run per row, with optional node/edge/degree info and matrix stats).
+
+Usage
+-----
+python batch_generateur.py 5 --nodes 20 --grid 10
+python batch_generateur.py 10 --xlsx my_runs.xlsx
+"""
+
+import argparse
+import subprocess
+import re
+import time
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+
+
+def extract_basename(path_str):
+    """Extracts the filename without extension from a given path string."""
+    return Path(path_str).stem
+
+
+# ---------- Regex definitions ------------------------------------------------
+
+# Matches .dot file info and optional graph stats
+DOT_STATS_REGEX = re.compile(
+    r"""['"]?
+    (?P<path>\.\.[^'"\s]+?\.dot)
+    (?:[^\n]*?num_nodes:\s*(?P<nodes>\d+))?
+    (?:,\s*num_edges:\s*(?P<edges>\d+))?
+    (?:,\s*max_degree:\s*(?P<degree>\d+))?
+    (?:,\s*num_strongly_components:\s*(?P<strongly>\d+))?
+    (?:,\s*num_components:\s*(?P<components>\d+))?
+    """,
+    re.VERBOSE,
+)
+
+# Matches matrix stats like m:3, n:3, N:4, density:0.444, etc.
+DOT_MATRIX_REGEX = re.compile(
+    r"\b([a-zA-Z_]+):([-+]?\d*\.?\d+)"
+)
+
+
+# ---------- Core logic -------------------------------------------------------
+def run_generateur_once(nodes: int, grid: int) -> list[dict]:
+    """Run generateur.py once and capture .dot + matrix stats."""
+    cmd = ["python", "generateur.py", "--nodes", str(nodes), "--grid", str(grid)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+    entries = []
+    stdout = result.stdout
+
+    # Extract .dot-related stats
+    for m in DOT_STATS_REGEX.finditer(stdout):
+        full_path = m.group("path")
+        entry = {
+            "filename": extract_basename(full_path),
+            "num_nodes": int(m.group("nodes")) if m.group("nodes") else None,
+            "num_edges": int(m.group("edges")) if m.group("edges") else None,
+            "max_degree": int(m.group("degree")) if m.group("degree") else None,
+            "num_components": int(m.group("components")) if m.group("components") else None,
+            "num_strongly_components": int(m.group("strongly")) if m.group("strongly") else None,
+        }
+
+        # Extract matrix-like values (m, n, density, etc.)
+        matrix_stats = dict(DOT_MATRIX_REGEX.findall(stdout))
+        for k, v in matrix_stats.items():
+            try:
+                matrix_stats[k] = float(v)
+            except ValueError:
+                pass
+
+        # Merge matrix stats into the entry
+        entry.update(matrix_stats)
+        entries.append(entry)
+
+    # If no .dot match but stats exist, still record them
+    if not entries:
+        matrix_stats = dict(DOT_MATRIX_REGEX.findall(stdout))
+        for k, v in matrix_stats.items():
+            try:
+                matrix_stats[k] = float(v)
+            except ValueError:
+                pass
+        entries.append(matrix_stats)
+
+    return entries
+
+
+def pad_rows(rows: list[list[dict]]) -> pd.DataFrame:
+    """Convert a ragged list of dict rows into a flat DataFrame."""
+    max_len = max(len(r) for r in rows)
+    padded = [row + [{}] * (max_len - len(row)) for row in rows]
+
+    flat_data = []
+    for row in padded:
+        flat_row = {}
+        for i, entry in enumerate(row):
+            prefix = f"file{i+1}_"
+            flat_row[prefix + "name"] = entry.get("filename")
+            flat_row[prefix + "nodes"] = entry.get("num_nodes")
+            flat_row[prefix + "edges"] = entry.get("num_edges")
+            flat_row[prefix + "degree"] = entry.get("max_degree")
+            flat_row[prefix + "components"] = entry.get("num_components")
+            flat_row[prefix + "strongly_components"] = entry.get("num_strongly_components")
+
+            # Add matrix stats explicitly
+            for key in ["m", "n", "N", "density", "row_var", "col_var", "i_mean", "j_mean", "spread", "entropy"]:
+                flat_row[prefix + key] = entry.get(key)
+
+        flat_data.append(flat_row)
+
+    return pd.DataFrame(flat_data)
+
+
+# ---------- Main program -----------------------------------------------------
+def main():
+    timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
+
+    parser = argparse.ArgumentParser(description="Batch-run generateur.py")
+    parser.add_argument("n", type=int, help="Number of times to run generateur.py")
+    parser.add_argument("--xlsx", default="generated_files", help="Excel output filename")
+    parser.add_argument("--nodes", type=int, default=20, help="Number of nodes")
+    parser.add_argument("--grid", type=int, default=10, help="Grid size")
+    args = parser.parse_args()
+
+    n = args.n
+    nodes = args.nodes
+    grid = args.grid
+
+    # Choose label by node count
+    if nodes == 20:
+        file_name = "class_a"
+    elif nodes == 40:
+        file_name = "class_b"
+    elif nodes == 50:
+        file_name = "class_c"
+    elif nodes == 60:
+        file_name = "class_d"
+    else:
+        file_name = "file"
+
+    excel_name = f"../generated_files_db/{file_name}_{timestamp}.xlsx"
+
+    all_rows = []
+
+    for i in range(n):
+        print(f"Run {i+1}/{n}…", end="", flush=True)
+        try:
+            files_this_run = run_generateur_once(nodes, grid)
+            all_rows.append(files_this_run)
+            print(f" captured {len(files_this_run)} file(s).")
+        except subprocess.CalledProcessError as exc:
+            print("\nError running generateur.py:\n", exc.stderr)
+            raise SystemExit(1)
+        time.sleep(0.5)
+
+    df = pad_rows(all_rows)
+
+    # Create a summary row with all filenames
+    summary_row = {col: "" for col in df.columns}
+    for col in df.columns:
+        if col.endswith("_name"):
+            combined = df[col].dropna().astype(str).tolist()
+            summary_row[col] = ",".join(f'"{name}"' for name in combined)
+
+    first_name_col = next((c for c in df.columns if c.endswith("_name")), None)
+    if first_name_col:
+        summary_row[first_name_col] = "TOTAL -> " + summary_row[first_name_col]
+
+    df = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
+
+    # Save to Excel
+    excel_path = Path(excel_name).expanduser().resolve()
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(excel_path, index=False)
+    print(f" Saved results to {excel_path}")
+
+
+if __name__ == "__main__":
+    main()

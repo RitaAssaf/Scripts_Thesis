@@ -1,0 +1,26 @@
+from pycsp3 import *
+alice , bob , sascha = persons = 0 , 1 , 2
+# culprit is among alice (0) , bob (1) and sascha (2)
+culprit = Var ( persons )
+# liking [ i ][ j ] is 1 iff the ith guy likes the jth guy
+liking = VarArray ( size =[3 , 3] , dom ={0 , 1})
+# taller [ i ][ j ] is 1 iff the ith guy is taller than the jth guy
+taller = VarArray ( size =[3 , 3] , dom ={0 , 1})
+satisfy (
+# the culprit likes Alice
+liking [ culprit ][ alice ] == 1 ,
+# the culprit is taller than Alice
+taller [ culprit ][ alice ] == 1 ,
+# nobody is taller than himself
+[ taller [ p ][ p ] == 0 for p in persons ] ,
+# the ith guy is taller than the jth guy iff the reverse is not true
+[ taller [ p1 ][ p2 ] != taller [ p2 ][ p1 ] for p1 in persons for p2 in persons if p1 != p2 ] ,
+# Bob likes no one that Alice likes
+[ If ( liking [ alice ][ p ] , Then =~ liking [ bob ][ p ]) for p in persons ] ,
+# Alice likes everybody except Bob
+[ liking [ alice ][ p ] == 1 for p in persons if p != bob ] ,
+# Sascha likes everyone that Alice likes
+[ If ( (liking [ 0 ][ 1 ] in [0,1]), Then = (taller[0][1] in [0,1]))  ] ,
+# nobody likes everyone
+[ Count ( liking [ p ] , value =0) >= 1 for p in persons ]
+)

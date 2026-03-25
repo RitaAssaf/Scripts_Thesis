@@ -1,0 +1,248 @@
+import argparse
+
+import subprocess
+import os
+from datetime import datetime
+import time
+import signal
+import re
+import openpyxl
+
+import resource
+
+# python run_bimodel_ilf_param.py --output "/home/etud/Bureau/projet/indicators_pos/run_23032026141936/"    --patterns  --pos_targets --rc_targets 
+
+
+#MAX_MEM_GB = 20
+MAX_MEM_GB = 20
+MAX_MEM_BYTES = MAX_MEM_GB * 1024**3  
+
+
+
+def limit_memory():
+	soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+	# Only lower the soft limit; do not try to raise hard limit
+	new_soft = min(MAX_MEM_BYTES, hard)
+	resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard))
+
+
+
+def import_to_excel(solver_output, pattern='',target='', ilf=False):
+	#Step 1: Clean ANSI escape sequences
+	ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+	clean_output = ansi_escape.sub('', solver_output)
+	target_save= target.replace('/','')
+	# Step 2: Extract metrics with individual fallback regexes
+	effs_matches = re.findall(r'effs\s*:\s*(\d+)', clean_output)
+	effs = effs_matches[-1] if effs_matches else "-"
+
+	stop_match = re.search(r'stop\s*:\s*([A-Z_]+)', clean_output)
+	stop = stop_match.group(1) if stop_match else "-"
+
+	wck_matches = re.findall(r'wck\s*:\s*(\d+\.\d+)', clean_output)
+	wck = wck_matches[-1] if wck_matches else "-"
+
+	cpu_match = re.search(r'cpu\s*:\s*(\d+\.\d+)', clean_output)
+	cpu = cpu_match.group(1) if cpu_match else "-"
+
+	mem_match = re.search(r'mem\s*:\s*(\S+)', clean_output)
+	mem = mem_match.group(1) if mem_match else "-"
+
+	unsat_match = re.search(r'\bs\s+UNSATISFIABLE\b', clean_output)
+	unsat = "Yes" if unsat_match else "No"
+
+	fails_matches = re.findall(r'fails\s*:\s*(\d+)', clean_output)
+	fails = fails_matches[-1] if fails_matches else "-"
+
+	wrong_dec_match = re.search(r'd\s+WRONG\s+DECISIONS\s+(\d+)', clean_output)
+	wrong_dec = wrong_dec_match.group(1) if wrong_dec_match else "-"
+
+	found_sols_match = re.search(r'd\s+FOUND\s+SOLUTIONS\s+(\d+)', clean_output)
+	found_sols = found_sols_match.group(1) if found_sols_match else "-"
+
+	complete_match = re.search(r'd\s+COMPLETE\s+EXPLORATION', clean_output)
+	complete = "Yes" if complete_match else "No"
+
+	# Step 3: Create Excel workbook
+	wb = openpyxl.Workbook()
+	ws = wb.active
+	ws.title = "Indicators"
+
+	# Step 3: Create Excel workbook
+	wb = openpyxl.Workbook()
+	ws = wb.active
+	ws.title = "Indicators"
+
+	headers = [
+		"Pattern", "Target", "ILF",  "Run",
+		"Dpts", "Effs", "Fails", "Wrgs", "Wck", "Ngds", "Sols",
+		"Stop", "CPU", "Mem", "UNSAT", "WrongDec", "FoundSols", "Complete",
+		"Solving time", "ilfmemo","ilfiterations"
+	]
+	ws.append(headers)
+
+	# Step 4: Prepare and append row
+	run_count = 1
+	row = [
+		pattern, target, ilf,
+		f"run{run_count}",  # Run ID
+		"-",                # Dpts (not extracted by fallback)
+		effs,
+		fails,               
+		wrong_dec,          # Wrgs (using wrong decisions)
+		wck,
+		"-",                # Ngds (not extracted by fallback)
+		found_sols,
+		stop,
+		cpu,
+		mem,
+		unsat,
+		wrong_dec,
+		found_sols,
+		complete,
+		TIMEOUT_SECONDS,
+	]
+	ws.append(row)
+
+	# Step 5: Save Excel file with memory error handling
+	timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
+	file_name = os.path.join(folder, f"indicators_{pattern}_{target_save}_{timestamp}.xlsx")
+
+	try:
+		wb.save(file_name)
+		print(f"Data has been written to {file_name}")
+
+	except MemoryError as mem_err:
+		print(f"MemoryError when saving Excel: {mem_err}")
+		# Free as much memory as possible
+		import gc
+		gc.collect()
+
+		# Try saving a minimal Excel file with just an error message
+		try:
+			wb_minimal = openpyxl.Workbook()
+			ws_min = wb_minimal.active
+			ws_min.title = "Indicators"
+			ws_min.append(["Status"])
+			ws_min.append(["stop: ACE_MEM_LIMIT"])
+			min_file_name = os.path.join(output_folder, f"indicators_{pattern}_{target_save}_{timestamp}.xlsx")
+			wb_minimal.save(min_file_name)
+			print(f"Minimal memory error report saved to {min_file_name}")
+		except Exception as e2:
+			print(f"Failed to save minimal Excel report: {e2}")
+
+	except Exception as e:
+		print(f"Error saving excel file: {e}")
+		sys.exit(1)
+
+
+def handle_error(e, pattern='', target='', ilf=False):
+	stderr = e.stderr or ""
+	stdout = e.stdout or ""
+
+	# Case 0: Timeout
+	if isinstance(e, subprocess.TimeoutExpired):
+		print("Timeout detected")
+		import_to_excel("stop: TIMEOUT", pattern, target, ilf)
+		return
+
+	# Case 1: Python MemoryError (rare but keep it)
+	if "MemoryError" in stderr:
+		print("OOM detected (MemoryError)")
+		import_to_excel("stop: OOM", pattern, target, ilf)
+		return
+
+	# Case 2: Return code exists
+	if hasattr(e, "returncode") and e.returncode is not None:
+
+		# 🔥 MOST IMPORTANT CASE
+		if e.returncode == 137:
+			print("Exit code 137 → OOM (SIGKILL)")
+			import_to_excel("stop: OOM", pattern, target, ilf)
+			return
+
+		# Killed by signal
+		if e.returncode < 0:
+			sig_num = -e.returncode
+
+			if sig_num == signal.SIGKILL:
+				print("Detected SIGKILL → very likely OOM")
+				import_to_excel("stop: OOM", pattern, target, ilf)
+
+			elif sig_num == signal.SIGTERM:
+				import_to_excel("stop: TERMINATED", pattern, target, ilf)
+
+			elif sig_num == signal.SIGINT:
+				import_to_excel("stop: ACE_TIMEOUT", pattern, target, ilf)
+
+			else:
+				import_to_excel(f"stop: killed by signal {sig_num}", pattern, target, ilf)
+
+			return
+
+		# ❗ Extra safety: silent OOM detection
+		if e.returncode != 0 and not stderr and not stdout:
+			print("No output + non-zero exit → likely OOM")
+			import_to_excel("stop: OOM?", pattern, target, ilf)
+			return
+
+	# Case 3: Generic failure
+	print(f"Process exited with code {e.returncode}")
+	# print("stdout:", stdout)
+	# print("stderr:", stderr)
+	import_to_excel(f"stop: exit code {e.returncode}", pattern, target, ilf)
+
+def run_bimodel(patterns,pos_targets, rc_targets, folder, TIMEOUT_SECONDS):
+	common_args_sets = [
+	]
+	
+
+	for pattern in patterns:
+		for i in range(len(pos_targets)):
+				command = [
+					"python", "bimodel_ilf.py",
+				"--pattern", pattern,
+				"--target", str(rc_targets[i]),
+				"--output", folder,  
+				"--pos_pattern", pattern,
+				"--pos_target", str(pos_targets[i]),
+				
+				]
+
+				print(f"Running command: {' '.join(command)}")
+				try:
+					subprocess.run(command, check=True, timeout=TIMEOUT_SECONDS,preexec_fn=limit_memory)
+				except subprocess.CalledProcessError as e:
+					print(f"Command failed: {e}")
+					handle_error(e,pattern, str(rc_targets[i]),False)
+				except subprocess.TimeoutExpired as e:
+					print(f"Timeout: {e}")
+					handle_error(e,pattern, str(rc_targets[i]),False)
+
+
+
+
+if __name__ == "__main__":
+
+	parser = argparse.ArgumentParser(description="Batch-run generateur.py")
+	timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
+	default_folder = f"/home/etud/Bureau/projet/indicators_pos/run_{timestamp}"
+
+	parser.add_argument("--patterns", type=str, help="patterns as comma-separated strings")
+	parser.add_argument("--pos_targets", type=str, help="targets as comma-separated strings")
+	parser.add_argument("--rc_targets", type=str, help="targets as comma-separated strings")
+
+	parser.add_argument("--output", type=str, help="output folder", default=default_folder)
+	#parser.add_argument("--timeout", type=str, help="timeout", default='3600')
+
+	args = parser.parse_args()
+	#print(args)
+	patterns = args.patterns.split(",") if args.patterns else []
+	pos_targets = args.pos_targets.split(",") if args.pos_targets else []
+	rc_targets = args.rc_targets.split(",") if args.rc_targets else []
+	TIMEOUT_SECONDS = 3600
+	folder = args.output
+	os.makedirs(folder, exist_ok=True)
+
+
+	run_bimodel(patterns,pos_targets,rc_targets, folder,TIMEOUT_SECONDS)

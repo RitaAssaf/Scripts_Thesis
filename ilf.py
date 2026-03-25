@@ -1,0 +1,985 @@
+import networkx as nx
+import matplotlib.pyplot as plt
+import inflect
+import os
+from collections import Counter
+from class_label_order import LabelOrder
+from class_node import Node
+import multiprocessing
+import traceback
+
+import time
+import psutil
+
+import sys
+
+# Optional: Only works on Unix (Linux/macOS)
+try:
+	import resource
+	def limit_memory(max_mb=500):
+		"""Set a memory limit on the current process (in MB)."""
+		soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+		resource.setrlimit(resource.RLIMIT_AS, (max_mb * 1024 * 1024, hard))
+except ImportError:
+	def limit_memory(max_mb):
+		pass 
+
+
+def _target(queue, func, args, kwargs, memory_limit_mb=None):
+	try:
+		# Optional memory limit (Linux/macOS)
+		if memory_limit_mb:
+			import resource
+			resource.setrlimit(resource.RLIMIT_AS, (memory_limit_mb * 1024 * 1024, resource.RLIM_INFINITY))
+
+		result = func(*args, **kwargs)
+		queue.put(("success", result))
+	except Exception:
+		queue.put(("error", traceback.format_exc()))
+
+
+def run_with_timeout(timeout, func, *args, memory_limit_mb=None, **kwargs):
+	queue = multiprocessing.Queue()
+	process = multiprocessing.Process(target=_target, args=(queue, func, args, kwargs, memory_limit_mb))
+	process.start()
+
+	proc_ps = psutil.Process(process.pid)
+	start_time = time.perf_counter()
+	peak_memory = 0
+
+	try:
+		while process.is_alive():
+			try:
+				mem = proc_ps.memory_info().rss / (1024 * 1024)  # in MB
+				peak_memory = max(peak_memory, mem)
+			except psutil.NoSuchProcess:
+				break  # Process ended quickly
+
+			time.sleep(0.1)
+			if time.perf_counter() - start_time > timeout:
+				print(f"Function '{func.__name__}' timed out after {timeout} seconds. Terminating...")
+				process.terminate()
+				process.join()
+				return None, timeout, peak_memory
+
+		process.join()
+
+		if not queue.empty():
+			status, result = queue.get()
+			exec_time = time.perf_counter() - start_time
+			if status == "success":
+				print(f"Function completed in {exec_time:.2f} seconds using {peak_memory:.2f} MB memory.")
+				return result, exec_time, peak_memory
+			else:
+				print("Function raised an exception:")
+				print(result)
+				return None, exec_time, peak_memory
+
+		if process.exitcode != 0:
+			print(f"Function '{func.__name__}' crashed or was killed (possibly out-of-memory).")
+		else:
+			print("Function exited without returning a result.")
+
+		return None, time.perf_counter() - start_time, peak_memory
+
+	except Exception as e:
+		print("Unexpected error during monitoring:", str(e))
+		process.terminate()
+		return None, None, None
+
+
+
+def eccentricity(G, start_node):
+	return  nx.eccentricity(G, start_node)
+
+def distancek(G, start_node, k):
+	# A dictionary where the keys are the nodes and the values 
+	# are the lengths of the shortest path from the source
+	#  node to each node. For e in Gt instance 1, a:3, j:4
+	lengths = nx.single_source_shortest_path_length(G, start_node)
+	# Count nodes that have a path length less than k
+	count = sum(1 for length in lengths.values() if 0 < length < k)
+	return count
+
+def get_num_cliques(G, node):
+	cliques_per_node = nx.number_of_cliques(G)
+	return cliques_per_node[node]
+
+def count_node_cycles(G, node):
+	cycles = nx.cycle_basis(G)
+	a=0
+	return sum(1 for cycle in cycles if node in cycle)
+
+def get_label(graph, node, alpha, dir=False):
+	if dir:
+		return str(graph.in_degree(node)) +'_'+ str(graph.out_degree(node))
+	else:
+
+		if alpha == "degree":
+			return graph.degree(node)
+		elif alpha== "distance":
+			return distancek(graph, node,2) #k=2
+		elif alpha== "eccentricity":
+			return eccentricity(graph,node)
+		elif alpha== "num_cliques":
+			return get_num_cliques(graph,node)
+		elif alpha== "cycle":
+			return count_node_cycles(graph,node)
+
+def hopcroft(m, m_prime, dir=False):
+	# Create a bipartite graph
+	B = nx.Graph()
+	
+	# Add nodes for each element in m and m'
+	left_nodes = ['m_' + str(i) for i in range(len(m))]
+	right_nodes = ['m_prime_' + str(j) for j in range(len(m_prime))]
+	
+	B.add_nodes_from(left_nodes, bipartite=0)  # Left set (m)
+	B.add_nodes_from(right_nodes, bipartite=1)  # Right set (m_prime)
+	
+	if dir:
+		# Add edges based on the partial order (a_i <= b_j)
+		for i, a_i in enumerate(m):
+			for j, b_j in enumerate(m_prime):
+				if label_less_than(a_i , b_j):
+					B.add_edge('m_' + str(i), 'm_prime_' + str(j))
+	else:
+		# Add edges based on the partial order (a_i <= b_j)
+		for i, a_i in enumerate(m):
+			for j, b_j in enumerate(m_prime):
+				if int(a_i) <= (b_j):
+					B.add_edge('m_' + str(i), 'm_prime_' + str(j))
+	
+	# Run Hopcroft-Karp algorithm to find maximum matching, specifying top_nodes
+	matching = nx.bipartite.maximum_matching(B, top_nodes=left_nodes)
+	
+	# Check if matching covers all elements of m (left set)
+	matched_left = [node for node in matching if node in left_nodes]
+	
+	# If all elements of m are matched, return True (m <= m')
+	return len(matched_left) == len(m)
+
+
+
+#	print(f"does m_1 preceds m_4?: {oneprecedstwo('m_1', 'm_4', ordered_labels)}")
+
+def oneprecedstwo(m, m_prime, ordered_labels):
+	# Find label and label_prime in a single loop
+	label, label_prime = None, None
+	for x in ordered_labels:
+		if x._name == m:
+			label = x
+		if x._name == m_prime:
+			label_prime = x
+		# Stop early if both are found
+		if label and label_prime:
+			break
+	
+	# Check if either label or label_prime is None
+	if label is None or label_prime is None:
+		print(f"label '{m}' or '{m_prime}' not found in ordered_labels")
+		return False
+
+	# Ensure `_preceds` is iterable and check for label_prime in it
+	if not isinstance(label._preceds, list):
+		print(f"Warning: _preceds attribute for '{label._name}' is not a list.")
+		return False
+
+	# Check if label_prime's name is in label's preceds list
+	result = label_prime._name in label._preceds
+   # print(f"Checking if '{label_prime._name}' is in '{label._name}'._preceds: {result}")
+   # print(f"prime: {label_prime} and label: {label}")
+	return result
+
+
+def hopcroft_multiset(m, m_prime, ordered_labels):
+	#print(f"does 'm_5', 'm_5' preceds m_3', 'm_4?: {hopcroft_multiset(['m_5', 'm_5'],['m_4'], ordered_labels)}")
+
+	# Create a bipartite graph
+	B = nx.Graph()
+	
+	# Add nodes for each element in m and m'
+	left_nodes = ['m_' + str(i) for i in range(len(m))]
+	right_nodes = ['m_prime_' + str(j) for j in range(len(m_prime))]
+	
+	B.add_nodes_from(left_nodes, bipartite=0)  # Left set (m)
+	B.add_nodes_from(right_nodes, bipartite=1)  # Right set (m_prime)
+	
+	# Add edges based on the partial order (a_i <= b_j)
+	for i, a_i in enumerate(m):
+		for j, b_j in enumerate(m_prime):
+			if oneprecedstwo( a_i, b_j, ordered_labels):
+				B.add_edge('m_' + str(i), 'm_prime_' + str(j))
+	
+	# Run Hopcroft-Karp algorithm to find maximum matching, specifying top_nodes
+	matching = nx.bipartite.maximum_matching(B, top_nodes=left_nodes)
+	
+	# Check if matching covers all elements of m (left set)
+	matched_left = [node for node in matching if node in left_nodes]
+	
+	# If all elements of m are matched, return True (m <= m')
+	return len(matched_left) == len(m)
+
+
+
+def build_partial_order_3(nodes, dir=False):
+	partial_order = {}
+	order_labels = []
+	label_letter='a'
+	if dir:
+		j=1
+		for node_a in nodes:
+		
+			exist= False
+			if len( order_labels)==0:
+				order_labels.append(LabelOrder(label_letter+'_' + str(j), node_a._label, [], [node_a._name],[], node_a._predecessors, node_a._successors ))
+				j=j+1
+				# for label_i in order_labels:
+				# 		if label_less_than(label_i._label ,order_labels[-1]._label ) and hopcroft(label_i._predecessors , order_labels[-1]._predecessors,dir)  and hopcroft(label_i._successors , order_labels[-1]._successors,dir):
+				# 			label_i._preceds.append(order_labels[-1]._name )
+			else:
+				for label_k in order_labels:
+					if label_k._label== node_a._label and Counter(node_a._predecessors) == Counter(label_k._predecessors) and Counter(node_a._successors) == Counter(label_k._successors): #Counter(list1) This checks whether both lists have the same elements with the same frequency, regardless of the order.            
+						exist= True  
+						# un noeud a un label qui existe déjà 
+						label_k.add_node(node_a._name)         
+						break
+				
+				if exist == False:
+					order_labels.append(LabelOrder(label_letter+'_' + str(j), node_a._label, [], [node_a._name],[], node_a._predecessors, node_a._successors ))
+					j=j+1
+					# for label_i in order_labels:
+					# 	if label_less_than(label_i._label ,order_labels[-1]._label ) and hopcroft(label_i._predecessors , order_labels[-1]._predecessors, dir)  and hopcroft(label_i._successors , order_labels[-1]._successors,dir):
+					# 		label_i._preceds.append(order_labels[-1]._name )
+		for label_i in order_labels:
+			for label_j in order_labels:
+				if label_less_than(label_i._label ,label_j._label ) and hopcroft(label_i._predecessors , label_j._predecessors, dir)  and hopcroft(label_i._successors , label_j._successors,dir):
+					if label_j._name not in label_i._preceds:
+						label_i._preceds.append(label_j._name )
+	
+	else:
+
+		j=1
+		for node_a in nodes:
+		
+			exist= False
+			if len( order_labels)==0:
+				order_labels.append(LabelOrder(label_letter+'_' + str(j), node_a._label, [], [node_a._name],[], node_a._predecessors, node_a._successors ))
+				j=j+1
+				#comparer l'élt qu'on vient d'ajouter avec les labels de la liste 
+				# dans ce cas len=0 l'elt label m1 sera ajouté à preceds de lui même
+				# for label_i in order_labels:
+				# 	# comparaison qui dépend de degré comment comparer m1 m2
+				# 		if int(label_i._label) <= int(order_labels[-1]._label) and hopcroft(label_i._neighbors_labels , order_labels[-1]._neighbors_labels, dir):
+				# 			label_i._preceds.append(order_labels[-1]._name )
+			else:
+				for label_k in order_labels:
+					if label_k._label== node_a._label and Counter(node_a._neighbors_labels) == Counter(label_k._neighbors_labels): #Counter(list1) This checks whether both lists have the same elements with the same frequency, regardless of the order.            
+						exist= True  
+						# un noeud a un label qui existe déjà 
+						label_k.add_node(node_a._name)         
+						break
+				
+				if exist == False:
+					order_labels.append(LabelOrder(label_letter+'_' + str(j), node_a._label, node_a._neighbors_labels, [node_a._name],[] ))
+					j=j+1
+					# for label_i in order_labels:
+					# 	if int(label_i._label) <= int(order_labels[-1]._label) and hopcroft(label_i._neighbors_labels , order_labels[-1]._neighbors_labels, dir):
+					# 		label_i._preceds.append(order_labels[-1]._name )
+		for label_i in order_labels:
+			for label_j in order_labels:
+				if int(label_i._label) <= int(label_j._label) and hopcroft(label_i._neighbors_labels , label_j._neighbors_labels, dir):
+					if label_j._name not in label_i._preceds:
+						label_i._preceds.append(label_j._name )
+			
+	return  order_labels
+
+#LabelOrder(self, name, label, neighbors_labels, nodes, preceds):
+#Node(self,name, label, neighbors_labels, domain, ispattern)
+
+
+def next_label(label):
+	if not label:
+		return 'a'
+	
+	label = list(label)
+	i = len(label) - 1
+	
+	while i >= 0 and label[i] == 'z':
+		label[i] = 'a'
+		i -= 1
+	
+	if i < 0:
+		label = ['a'] + label
+	else:
+		label[i] = chr(ord(label[i]) + 1)
+	
+	return ''.join(label)
+
+
+
+
+def build_partial_order_4(nodes, ordered_labels, dir=False):
+	partial_order = {}
+	new_order_labels = []
+	
+	j=1
+	label_letter= ordered_labels[0]._name.split('_')[0]
+	#label_letter=chr(ord(label_letter) + 1)
+	label_letter = next_label(label_letter)
+
+	
+	if dir:
+		for node_a in nodes:
+	
+			label_label_ajouté= node_a._label
+			
+			exist= False
+			if len( new_order_labels)==0:
+				new_order_labels.append(LabelOrder(label_letter +'_'+ str(j), node_a._label, [], [node_a._name],[], node_a._predecessors, node_a._successors ))
+				
+				j=j+1
+				
+				#Suppose we have n1= m1.{m1,m1} and want to add n2=m2.{m3}, n1<n2
+				# check m1< m2 i.e. m2 in m1.preceds and hopcroft multiset ({m1, m1}, {m3})
+				for label_i in new_order_labels: 
+		
+					objet_label_label_boucle=[x for x in ordered_labels if x._name == label_i._label][0] # get m1 from the old ordered labels
+			else:
+				for label_k in new_order_labels:
+					if label_k._label== node_a._label and Counter(node_a._predecessors) == Counter(label_k._predecessors) and Counter(node_a._successors) == Counter(label_k._successors):#Counter(list1) This checks whether both lists have the same elements with the same frequency, regardless of the order.            
+
+					#if label_k._label== node_a._label and Counter(node_a._neighbors_labels) == Counter(label_k._neighbors_labels): #Counter(list1) This checks whether both lists have the same elements with the same frequency, regardless of the order.            
+						exist= True  
+						# un noeud a un label qui existe déjà 
+						label_k.add_node(node_a._name)         
+						break
+				
+				if exist == False:
+					new_order_labels.append(LabelOrder(label_letter +'_'+ str(j), node_a._label, [], [node_a._name],[], node_a._predecessors, node_a._successors ))
+					j=j+1
+					# for label_i in new_order_labels:
+					# 	objet_label_label_boucle=[x for x in ordered_labels if x._name == label_i._label][0] 
+				
+					# 	if  label_label_ajouté in objet_label_label_boucle._preceds and hopcroft_multiset(label_i._predecessors, node_a._predecessors, ordered_labels) and hopcroft_multiset(label_i._successors, node_a._successors, ordered_labels):
+					# 		label_i._preceds.append(new_order_labels[-1]._name )
+	
+		#comparer chaque label l_i avec les labels de la liste pour voir si  l_i preceds l_j
+		# for label_i in new_order_labels:#exemple label_i=b2=a1.a4.(a5,a6)
+		# 		for label_j in new_order_labels:
+		# for label_i in [label for label in new_order_labels if label._name == 'b_5']:
+		# 	for label_j in [label for label in new_order_labels if label._name == 'b_36']:
+		for label_i in  new_order_labels :
+			for label_j in  new_order_labels :
+						
+			#prendre les attributs du l_i c a d prendre l'objet a1 de b2
+					objet_label_boucle=[x for x in ordered_labels if x._name == label_i._label][0] 
+					#si  le label a14 de l_j est dans la liste des preceds de label a1 du l_i et les multisets l_i sont< à l_j selon l'ancien ordre (a5,a6)< (a7,a8) 
+					if  label_j._label in objet_label_boucle._preceds and hopcroft_multiset(label_i._predecessors, label_j._predecessors, ordered_labels) and hopcroft_multiset(label_i._successors, label_j._successors, ordered_labels):
+					#si l_j n'est pas déjà ajoutée
+						if label_j._name not in label_i._preceds:
+							label_i._preceds.append(label_j._name )
+
+	else:
+		for node_a in nodes:
+		
+			label_label_ajouté= node_a._label
+			neighbors_label_ajouté=node_a._neighbors_labels
+			exist= False
+			if len( new_order_labels)==0:
+				new_order_labels.append(LabelOrder(label_letter +'_'+ str(j), node_a._label, node_a._neighbors_labels, [node_a._name],[] ))
+				j=j+1
+				
+				#Suppose we have n1= m1.{m1,m1} and want to add n2=m2.{m3}, n1<n2
+				# check m1< m2 i.e. m2 in m1.preceds and hopcroft multiset ({m1, m1}, {m3})
+				# for label_i in new_order_labels: 
+		
+				# 	objet_label_label_boucle=[x for x in ordered_labels if x._name == label_i._label][0] # get m1 from the old ordered labels
+				
+				# 	if  label_label_ajouté in objet_label_label_boucle._preceds and hopcroft_multiset(label_i._neighbors_labels, neighbors_label_ajouté, ordered_labels):
+				# 		label_i._preceds.append(new_order_labels[-1]._name )
+			else:
+				for label_k in new_order_labels:
+					if label_k._label== node_a._label and Counter(node_a._neighbors_labels) == Counter(label_k._neighbors_labels): #Counter(list1) This checks whether both lists have the same elements with the same frequency, regardless of the order.            
+						exist= True  
+						# un noeud a un label qui existe déjà 
+						label_k.add_node(node_a._name)         
+						break
+				
+				if exist == False:
+					new_order_labels.append(LabelOrder(label_letter +'_'+ str(j), node_a._label, node_a._neighbors_labels, [node_a._name],[] ))
+					j=j+1
+					# for label_i in new_order_labels:
+					# #on retrouve le label de la liste m déjà construite
+					# 	objet_label_label_boucle=[x for x in ordered_labels if x._name == label_i._label][0] 
+				
+					# 	if  label_label_ajouté in objet_label_label_boucle._preceds and hopcroft_multiset(label_i._neighbors_labels, neighbors_label_ajouté, ordered_labels):
+					# 		label_i._preceds.append(new_order_labels[-1]._name )
+		for label_i in new_order_labels:  #pour chaque label l_i
+			for label_j in new_order_labels: #vérifier si l_i preceds l_j 
+
+				objet_label_boucle=[x for x in ordered_labels if x._name == label_i._label][0] # get m1 from the old ordered labels
+				#si le label l_j dans preceds de l_i et hopcroft l_i et l_j
+				if  label_j._label in objet_label_boucle._preceds and hopcroft_multiset(label_i._neighbors_labels, label_j._neighbors_labels, ordered_labels):
+					if label_j._name not in label_i._preceds:
+						label_i._preceds.append(label_j._name )
+			
+	return  new_order_labels
+
+
+def ILF(Gp, Gt, posp={}, post={}, instance=[]):
+	#labeling="eccentricity"
+	labeling="degree"
+
+	p = inflect.engine()
+	#INITIAL DOMAINS##############################################
+	print('	#INITIAL DOMAINS##############################################')
+	
+	#  def __init__(self,name, label, neighbors_labels, domain, pattern):
+	nodes_array = [
+	Node(node,"" , [], list(Gt.nodes()), 1) 
+	for node in Gp.nodes()
+	]
+	
+	nodes_array.extend([
+	Node(node,"", [],[], 0) 
+	for node in Gt.nodes()
+	])
+
+	# for node in nodes_array:
+	# 	print(node)
+
+	#FIRST FILTERING ##############################################
+	# print(f"labeling {labeling} on {instance}############################################# ")
+	# print('	#FIRST FILTERING##############################################')
+
+	#etiquetage
+	for node in nodes_array:
+		if node._ispattern:
+			node._label= get_label(Gp, node._name, labeling)
+
+		else:
+			node._label= get_label(Gt, node._name, labeling)
+
+
+	#DOMAIN FILTERING############
+	for node in nodes_array:
+		for node_j in node._domain:
+			if not node._label <= [x for x in nodes_array if x._name == node_j][0]._label:
+				node._domain.remove(node_j)
+	
+	
+	# for node in nodes_array:
+	# 	print(node)
+
+	#FIRST ITERATION##############################################
+	
+	print('	#1st ITERATION##############################################')
+
+
+	for node in nodes_array:
+		if node._ispattern:
+			node._label=get_label(Gp, node._name, labeling)
+			node._neighbors_labels=list(get_label(Gp, neighbor, labeling) for neighbor in Gp.neighbors(node._name))
+		else:
+			node._label=get_label(Gt, node._name,labeling)
+			node._neighbors_labels=list(get_label(Gt, neighbor, labeling) for neighbor in Gt.neighbors(node._name))
+
+
+	ordered_labels= build_partial_order_3(nodes_array, False )
+	
+	#DOMAIN FILTERING###################################
+	for label in ordered_labels:
+		nodes_preced=[]
+		#prendre les noeuds preceds dans le domaine du label _ispattern
+		for label_preced in label._preceds: #m1 < m2,m3,m4
+			# prendre m2
+			labelpreced= [x for x in ordered_labels if x._name == label_preced ][0] 
+			
+			#prendre les noeuds qui ont label m2
+			for nodepreced in labelpreced._nodes:
+				#vérifier que le noeud n'est pas pattern avant de l'ajouter
+				if not [x for x in nodes_array if x._name == nodepreced][0]._ispattern:
+					nodes_preced.append(nodepreced)
+			#pour les noeus qui ont ce label ajouter les noeuds preceds au domaine
+		for node in label._nodes:
+			noeud= [x for x in nodes_array if x._name == node][0]
+			noeud._domain=nodes_preced
+	
+
+	# print('## NODES ARRAY ##############################')
+	# for node in nodes_array:
+	# 	print(node)
+
+	# print('## LABELS ARRAY ##############################')
+	# for label in ordered_labels:
+	# 	print(label)
+
+	
+
+	# ITERATIONS LOOP ##############################################
+	for i in range(2, 10): #k=10 max iterations
+		domains_unchanged= True
+		num_labels_unchanged= True
+
+		print(f"	#{p.ordinal(i)} ITERATION  ############################################")
+		
+		for node in nodes_array:
+			node._label=[x for x in ordered_labels if node._name in x._nodes ][0]._name
+			
+		# Create a lookup dictionary for name-to-node mappings
+		node_dict = {node._name: node for node in nodes_array}
+
+		# Update each node's neighbor labels using the dictionary
+		for node in nodes_array :
+			if node._ispattern:
+				node._neighbors_labels=list([node_dict[neighbor]._label for neighbor in Gp.neighbors(node._name) if neighbor in node_dict])
+			else:
+				node._neighbors_labels=list([node_dict[neighbor]._label for neighbor in Gt.neighbors(node._name) if neighbor in node_dict])
+		
+		
+		
+		new_ordered_labels= build_partial_order_4(nodes_array , ordered_labels)
+		
+		#DOMAIN FILTERING###################################
+		#pour chaque label de l'ordre, prendre les labels qui suivent 
+		#m1< m2, m3, m4 : prendre  m2, m3, m4  
+		#et pour tous les noeuds qui ont lable m1, ajouter les noeuds qui ont label m2 ou m3 ou m4 au domaine de m1
+		for label in new_ordered_labels:
+			nodes_preced=[]
+			#ajouter les noeuds aux domaines
+			for label_preced in label._preceds: #m1 < m2,m3,m4
+
+				# prendre m2 en tant qu'objet			
+				labelpreced = [x for x in new_ordered_labels if x._name == label_preced] [0]
+				
+				#prendre les noeuds qui ont label m2
+				for nodepreced in labelpreced._nodes:
+					#vérifier que le noeud est pattern avant de l'ajouter
+					if not [x for x in nodes_array if x._name == nodepreced][0]._ispattern:
+						nodes_preced.append(nodepreced)
+			
+			#pour les noeus patterne qui ont ce label affecter les noeuds preceds au domaine
+			for node in label._nodes:
+				noeud= [x for x in nodes_array if x._name == node][0]
+				if noeud._ispattern:
+					# si le domaine d'un noeud est différent des noeuds affectés
+					if domains_unchanged and Counter(noeud._domain) != Counter(nodes_preced):
+						domains_unchanged=False
+					noeud._domain= nodes_preced
+		
+		
+		if len(ordered_labels)!= len(new_ordered_labels):
+			num_labels_unchanged=False
+
+		# la prochaine itération on utilise les nouveaux labels n1,n2,.. pour comparer o1=n1.{n} et o2=n2.{n3}
+		ordered_labels= new_ordered_labels
+
+
+		# print('## NODES ARRAY ##############################')
+		# for node in nodes_array:
+		# 	print(node)
+
+		# print('## LABELS ARRAY ##############################')
+		# for label in new_ordered_labels:
+		# 	print(label) 
+
+		if num_labels_unchanged and domains_unchanged:
+			print(f"Fixpoint reached at {p.ordinal(i)} iteration for labeling {labeling} on############################################# ")
+			break
+	
+	print('returning nodes array')
+	#return nodes_array
+	return  {node._name: [int(value) for value in node._domain] for node in nodes_array if node._ispattern}
+
+
+def label_less_than(label_1, label_2):
+	return (int(label_1.split('_')[0]) <= int(label_2.split('_')[0]) and 
+					int(label_1.split('_')[1]) <= int(label_2.split('_')[1]))
+
+
+def dir_ILF(Gp, Gt, posp={}, post={}):
+	labeling="degree"
+	p = inflect.engine()
+	#INITIAL DOMAINS##############################################
+	print('	#INITIAL DOMAINS##############################################')
+	
+	#  def __init__(self,name, label, neighbors_labels, domain, pattern):
+	nodes_array = [
+	Node(node, "", [], list(Gt.nodes()), 1, set(), set())  # Explicitly provide empty sets
+	for node in Gp.nodes()
+	]
+
+	nodes_array.extend([
+	Node(node, "", [], [], 0, set(), set())  # Explicitly provide empty sets
+	for node in Gt.nodes()
+	])
+
+	# for node in nodes_array:
+	# 	print(node)
+
+	#FIRST FILTERING ##############################################
+	print(f"labeling {labeling} on {instance}############################################# ")
+	print('	#FIRST FILTERING##############################################')
+
+	
+	for node in nodes_array:
+		if node._ispattern:
+			node._label= get_label(Gp, node._name, labeling,True)
+
+		else:
+			node._label= get_label(Gt, node._name, labeling,True)
+
+
+	#DOMAIN FILTERING############
+	for node in nodes_array:
+		for node_j in list(node._domain):
+			node_target=[x for x in nodes_array if x._name == node_j][0]
+			# if not (node._label.split('_')[0] <= node_target._label.split('_')[0] and 
+			# 		node._label.split('_')[1] <= node_target._label.split('_')[1]):
+			if not (int(node._label.split('_')[0]) <= int(node_target._label.split('_')[0]) and 
+			int(node._label.split('_')[1]) <= int(node_target._label.split('_')[1])):
+
+				node._domain.remove(node_j)
+	
+	
+	# for node in nodes_array:
+	# 	print(node)
+	# breakpoint=1
+	#FIRST ITERATION##############################################
+	
+	print('	#1st ITERATION##############################################')
+
+	predecessors = list()
+	successors = list()
+	
+	for node in nodes_array:
+		if node._ispattern:
+			node._label = get_label(Gp, node._name, labeling, True)
+			node._neighbors_labels = [get_label(Gp, neighbor, labeling, True) for neighbor in Gp.neighbors(node._name)]
+			
+			# Ensure lists are initialized to avoid "not defined" errors
+			predecessors = list(Gp.predecessors(node._name)) if node._name in Gp else []
+			successors = list(Gp.successors(node._name)) if node._name in Gp else []
+
+			node._predecessors = [get_label(Gp, pred, labeling, True) for pred in predecessors]
+			node._successors = [get_label(Gp, succ, labeling, True) for succ in successors]
+			a=0
+		else:
+			node._label = get_label(Gt, node._name, labeling, True)
+			node._neighbors_labels = [get_label(Gt, neighbor, labeling) for neighbor in Gt.neighbors(node._name)]
+			
+			# Ensure lists are initialized to avoid "not defined" errors
+			predecessors = list(Gt.predecessors(node._name)) if node._name in Gt else []
+			successors = list(Gt.successors(node._name)) if node._name in Gt else []
+
+			node._predecessors = [get_label(Gt, pred, labeling,True) for pred in predecessors]
+			node._successors = [get_label(Gt, succ, labeling,True) for succ in successors]
+
+
+	ordered_labels= build_partial_order_3(nodes_array , True)
+	
+	#DOMAIN FILTERING###################################
+	for label in ordered_labels:
+		nodes_preced=[]
+		#prendre un label de l'ordre partiel
+		for label_preced in label._preceds: #m1 < m2,m3,m4
+			labelpreced= [x for x in ordered_labels if x._name == label_preced ][0] # prendre m2
+			
+			#prendre les noeuds qui ont label m2
+			for nodepreced in labelpreced._nodes:
+				#ajouter les noeuds qui ont label m2 à la liste des noeuds qui seront ajoutés aux noeuds qui ont label m1
+				if not [x for x in nodes_array if x._name == nodepreced][0]._ispattern:
+					nodes_preced.append(nodepreced)
+			#pour les noeuds qui ont label m1 ajouter les noeuds du label m2
+		for node in label._nodes:
+			noeud= [x for x in nodes_array if x._name == node][0]
+			noeud._domain= nodes_preced
+	
+
+	# print('## NODES ARRAY ##############################')
+	# for node in nodes_array:
+	# 	print(node)
+
+	# print('## LABELS ARRAY ##############################')
+	# for label in ordered_labels:
+	# 	print(label)
+
+
+	k=100
+	# ITERATIONS LOOP ##############################################
+	for i in range(2, k): #k=100 max iterations
+		domains_unchanged= True
+		num_labels_unchanged= True
+
+		print(f"	#{p.ordinal(i)} ITERATION  ############################################")
+		
+		#label of node becomes m1,m2... if m1 has the node in its list
+		for node in nodes_array:
+			node._label=[x for x in ordered_labels if node._name in x._nodes ][0]._name
+			
+		# Create a lookup dictionary for name-to-node mappings
+		node_dict = {node._name: node for node in nodes_array}
+
+		# Update each node's neighbor labels using the dictionary
+		for node in nodes_array :
+			if node._ispattern:
+				
+				predecessors = list(Gp.predecessors(node._name)) if node._name in Gp else []
+				successors = list(Gp.successors(node._name)) if node._name in Gp else []
+
+				node._predecessors = [node_dict[pred]._label for pred in predecessors]
+				node._successors = [node_dict[succ]._label for succ in successors]
+				
+			else:
+				predecessors = list(Gt.predecessors(node._name)) if node._name in Gt else []
+				successors = list(Gt.successors(node._name)) if node._name in Gt else []
+
+				node._predecessors = [node_dict[pred]._label for pred in predecessors]
+				node._successors = [node_dict[succ]._label for succ in successors]
+				
+		
+		
+		new_ordered_labels= build_partial_order_4(nodes_array , ordered_labels,True)
+		
+		#DOMAIN FILTERING###################################
+		#pour chaque label de l'ordre, prendre les labels qui suivent 
+		#m1< m2, m3, m4 : prendre  m2, m3, m4  
+		#et pour tous les noeuds qui ont lable m1, ajouter les noeuds qui ont label m2 ou m3 ou m4 au domaine de m1
+		for label in new_ordered_labels:
+			nodes_preced=[]
+			#ajouter les noeuds aux domaines
+			for label_preced in label._preceds: #m1 < m2,m3,m4
+
+				# prendre m2 en tant qu'objet			
+				labelpreced = [x for x in new_ordered_labels if x._name == label_preced] [0]
+				
+				#prendre les noeuds qui ont label m2
+				for nodepreced in labelpreced._nodes:
+					#vérifier que le noeud est pattern avant de l'ajouter
+					if not [x for x in nodes_array if x._name == nodepreced][0]._ispattern:
+						nodes_preced.append(nodepreced)
+			
+   			#pour les noeus patterne qui ont ce label affecter les noeuds preceds au domaine
+			for node in label._nodes:
+				noeud= [x for x in nodes_array if x._name == node][0]
+				if noeud._ispattern:
+					# si le domaine d'un noeud est différent des noeuds affectés
+					if domains_unchanged and Counter(noeud._domain) != Counter(nodes_preced):
+						domains_unchanged=False
+					noeud._domain= nodes_preced
+		
+		
+		if len(ordered_labels)!= len(new_ordered_labels):
+			num_labels_unchanged=False
+
+		# la prochaine itération on utilise les nouveaux labels n1,n2,.. pour comparer o1=n1.{n} et o2=n2.{n3}
+		ordered_labels= new_ordered_labels
+
+
+		# print('## NODES ARRAY ##############################')
+		# for node in nodes_array:
+		# 	print(node)
+
+		# print('## LABELS ARRAY ##############################')
+		# for label in new_ordered_labels:
+		# 	print(label) 
+
+		if num_labels_unchanged and domains_unchanged:
+			print(f"Fixpoint reached at {p.ordinal(i)} iteration for labeling {labeling} on {instance}############################################# ")
+			break
+	
+	# Draw the graph
+	# plt.figure(figsize=(8, 6))  # Set the figure size
+
+	# if len(Gt.nodes)==len(post):
+	# 	nx.draw(Gt, post, with_labels=True, node_color='lightblue', edge_color='gray', node_size=1000, font_size=15)
+
+	# else:
+	# 	nx.draw(Gt, with_labels=True, node_color='lightblue', edge_color='gray', node_size=1000, font_size=15)
+
+	# if len(Gp.nodes)==len(posp):
+	# 	nx.draw(Gp, posp, with_labels=True, node_color='lightblue', edge_color='gray', node_size=1000, font_size=15)
+
+	# else:
+	# 	nx.draw(Gp, with_labels=True, node_color='lightblue', edge_color='gray', node_size=1000, font_size=15)
+
+
+	# Display the graph
+	#plt.title("Graph Gt")
+	#plt.show()
+	return nodes_array
+
+
+
+
+
+
+
+# MAIN #############################################################################
+
+# Instance 1: tokn graph relatively lightweight
+
+instance="Instance 1"
+""" Gp = nx.Graph([(1, 2), (2, 3), (3, 4), (4, 1)])  
+
+Gt = nx.Graph([  
+	('a', 'b'), ('c', 'b'), ('b', 'd'), ('d', 'e'), ('e', 'f'),
+	('f', 'g'), ('f', 'h'), ('h', 'i'), ('i', 'j'), ('j', 'k'), ('k', 'h')
+]) 
+
+post = {}
+
+posp={1: (-1, 2), 4: (-1, 1.5), 2: (-1.5,2), 3: (-1.5,1.5)}
+ """
+#print(f"distancek(Gt, 'e',4: {distancek(Gt, 'e',4 )}")
+
+
+#Instance 2: exemple P. Frédéric
+""" 
+instance="Instance 2"
+Gp = nx.Graph([(1, 2), (2, 3), (3, 4), (4, 1), (4, 5)])  
+
+Gt = nx.Graph([ 
+	('a', 'b'), ('a', 'd'), ('b', 'c'), ('b', 'e'), ('c', 'f'), ('d', 'e'),
+	('d', 'g'), ('e', 'f'), ('e', 'h'), ('f', 'i'), ('g', 'h'), ('h', 'i')
+])
+
+
+post={}
+posp={1: (-1, 2), 4: (-1, 1), 5: (-1,0.5), 2: (-1.5,2), 3: (-1.5,1)}
+
+ """
+#Instance 3: intersections graph de I1
+
+""" instance="Instance 3"
+Gp = nx.Graph([('l1', 'c2'), ('l1', 'c1'), ('l2', 'c2'), ('l2', 'c1')])  
+
+Gt = nx.Graph([ 
+	('l1p', 'c2p'), ('l2p', 'c1p'), ('l2p', 'c2p'), ('l2p', 'c3p'), ('l2p', 'c5p')
+	, ('l3p', 'c5p'),  ('l3p', 'c6p'), ('l4p', 'c4p'),  ('l4p', 'c5p'),  ('l5p', 'c4p') , ('l5p', 'c5p') 
+])
+
+post = {
+	'l1p': (0, 6), 'l2p': (0, 5), 'l3p': (0, 4), 'l4p': (0, 3),
+	'l5p': (0, 2), 'c1p': (2, 6), 'c2p': (2,5), 'c3p': (2,4),
+	'c4p': (2, 3), 'c5p': (2, 2), 'c6p': (2,1)
+} 
+
+posp={'l1': (-1, 2), 'l2': (-1, 1), 'c1': (-1.5,2), 'c2': (-1.5,1)} 
+ """
+# Instance 4: instance 1 + transitivité
+
+""" Gp = nx.Graph([(1, 2), (2, 3), (3, 4), (4, 1)])  
+
+Gt = nx.Graph([  
+	('a', 'c'), ('c', 'b'), ('c', 'd'), ('d', 'e'), ('e', 'f'),
+	('f', 'g'), ('f', 'h'), ('h', 'i'), ('i', 'j'), ('j', 'k'), ('k', 'h'),
+	#transitivite
+	('a', 'd'), ('a', 'e'),('e','h'), ('e','i'), ('f','i')
+]) 
+
+
+post = {}
+posp={1: (-1, 2), 4: (-1, 1.5), 2: (-1.5,2), 3: (-1.5,1.5)} 
+ """
+# Instance 5: relatively large graph
+""" instance="Instance 5"
+Gp = nx.Graph([(1, 2), (2, 3), (1, 4), (4, 5), (2,5)
+, (4, 5), (5, 6), (3, 6), (5, 7), (5, 6), (6, 8), (7, 8), (8, 9)])  
+
+Gt = nx.Graph([  
+	('a', 'b'), ('b', 'c'), ('b', 'i'),('b', 'j'),
+	('d', 'c'), ('f', 'c'),('d','e'), ('f', 's'),
+	('s', 'g'), ('g', 'm'), ('h', 's'),('h', 'i'),('h', 'l'),
+	('i', 'h'),('i', 'k'), ('i', 'b'), ('j','k'),
+	('k','l'),('k','n'), ('l', 'm'), ('l','o'), 
+	('m','r'), ('n','o'),
+	('o', 'p'), ('p','q'), ('q', 'r')            
+]) 
+
+
+posp = {
+	1: (-5, 5),  2: (-4, 5),  3: (-3, 5),
+	4: (-5, 4),  5: (-4, 4),  6: (-3, 4),
+	7: (-4, 3),  8: (-3, 3),  9: (-3, 2)
+}
+
+# Layout for Gt (Lower-right quadrant)
+post = {
+	'a': (-2, 0),   # Leftmost on the top level
+	'b': (-1, 0),   # To the right of a
+	'i': (0, 0),    # Centered
+	'h': (1, 0),    # To the right of i
+	's': (2, 0),    # To the right of h
+	'g': (3, 0),    # Rightmost on the top level
+	'j': (-1, -1),  # Leftmost on the lower level
+	'k': (0, -1),   # Centered below i
+	'l': (1, -1),   # To the right of k
+	'm': (3, -1),   # To the right of l
+	'd': (-1, 2),   # Above a
+	'c': (-1, 1),   # Between d and b
+	'f': (2, 1),    # Above h
+	'e': (-1, 3),   # Highest point in the graph
+	'n': (0, -2),   # Below k
+	'o': (1, -2),   # Below n
+	'p': (1, -4),  # Below j
+	'q': (1, -5),  # Below p
+	'r': (3, -5)    # Below m
+} """
+
+def load(instance, graph_file, id):
+	
+	# Load graph
+	graph = nx.drawing.nx_agraph.read_dot(graph_file).to_directed()
+
+	# Plot input graph
+	pydot.graph_from_dot_file(graph_file)[0].write_png(f'res/{Path(os.path.basename(graph_file)).stem}.png')
+
+	# Get graph edges and labels
+	#edges = graph.edges
+	edges = [(u, v, d['angle']) for u, v, d in graph.edges(data=True) if 'angle' in d]
+	labels = nx.get_node_attributes(graph, 'label')
+	angles = nx.get_edge_attributes(graph, 'angle')
+
+	# Set instance data
+	instance[f'NV_{id}'] = graph.number_of_nodes()
+	instance[f'NE_{id}'] = graph.number_of_edges()
+	instance[f'V{id}'] = [label for label in labels.values()]
+	instance[f'E{id}'] = list()
+	instance[f'A{id}'] = list()
+	for n1, n2, a in edges:
+		instance[f'E{id}'].append((int(n1), int(n2)))
+		key = (n1, n2, 0) if (n1, n2, 0) in angles else (n1, n2)
+		instance[f'A{id}'].append('Horizontal' if angles[key] == '0' else 'Vertical')
+
+################################################################
+
+if __name__ == "__main__":
+	
+	pattern='ladder'
+	target='lctr-07282025080535'
+
+	# Go to parent directory
+	os.chdir(os.path.dirname(os.path.realpath(__file__)) + '/..')
+
+	Gp = nx.drawing.nx_agraph.read_dot(f'lcres/{pattern}.dot')
+	Gt = nx.drawing.nx_agraph.read_dot(f'lcres/{target}.dot')
+	
+	#well formed
+	#Gp = nx.Graph([("1p", "2p"), ("2p", "3p"), ("1p", "4p"), ("4p", "3p")]) 
+	#Gp = nx.Graph([(1, 2), (2, 3), (1, 4),(4, 3) ]) 
+	# Transform nodes by appending 'p'
+	Gp = nx.relabel_nodes(Gp, {node: f"{node}p" for node in Gp.nodes()})
+	#pan
+	#Gt =nx.Graph([(1, 2), (2, 3), (1, 4),(4, 3), (4,5)])  
+
+	posp={}
+	post={}
+	#dir_ILF(Gp,Gt)
+	result = run_with_timeout(2000, ILF, Gp, Gt, posp, post)
+
+	if result is None:
+		print("Function failed due to timeout.")
+	else:
+		print("Function completed successfully.")

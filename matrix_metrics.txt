@@ -1,0 +1,12 @@
+=== Matrix Distribution Metrics ===
+
+Matrix size: 3 x 3
+Number of 1s: 7
+
+Density: 0.7778
+Row variance: 0.2222
+Column variance: 0.2222
+Center of mass: (1.00, 1.00)
+Spatial spread: 1.1429
+Entropy: 2.1972
+max_card: 3

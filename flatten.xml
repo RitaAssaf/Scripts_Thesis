@@ -1,0 +1,5 @@
+<instance format="XCSP3" type="CSP">
+  <variables>
+    <array id="x" size="[3][3]"> 0 1 </array>
+  </variables>
+</instance>
